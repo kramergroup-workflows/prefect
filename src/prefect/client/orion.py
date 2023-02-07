@@ -47,6 +47,9 @@ from prefect.settings import (
     PREFECT_API_REQUEST_TIMEOUT,
     PREFECT_API_TLS_INSECURE_SKIP_VERIFY,
     PREFECT_API_URL,
+    PREFECT_API_CLIENT_CERT_PATH,
+    PREFECT_API_CLIENT_KEY_PATH,
+    PREFECT_API_CLIENT_KEY_PASSPHRASE,
     PREFECT_ORION_DATABASE_CONNECTION_URL,
 )
 
@@ -115,6 +118,20 @@ class OrionClient:
 
         if PREFECT_API_TLS_INSECURE_SKIP_VERIFY:
             httpx_settings.setdefault("verify", False)
+
+        if PREFECT_API_CLIENT_CERT_PATH and PREFECT_API_CLIENT_KEY_PATH and PREFECT_API_CLIENT_KEY_PASSPHRASE:
+            httpx_settings.setdefault("cert", (
+                PREFECT_API_CLIENT_CERT_PATH.value(),
+                PREFECT_API_CLIENT_KEY_PATH.value(),
+                PREFECT_API_CLIENT_KEY_PASSPHRASE.value()
+            ))
+        elif PREFECT_API_CLIENT_CERT_PATH and PREFECT_API_CLIENT_KEY_PATH:
+            httpx_settings.setdefault("cert", (
+                PREFECT_API_CLIENT_CERT_PATH.value(),
+                PREFECT_API_CLIENT_KEY_PATH.value()
+            ))
+        elif PREFECT_API_CLIENT_CERT_PATH:
+            httpx_settings.setdefault("cert", PREFECT_API_CLIENT_CERT_PATH.value())
 
         if api_version is None:
             # deferred import to avoid importing the entire server unless needed
