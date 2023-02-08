@@ -50,6 +50,7 @@ from prefect.settings import (
     PREFECT_API_CLIENT_CERT_PATH,
     PREFECT_API_CLIENT_KEY_PATH,
     PREFECT_API_CLIENT_KEY_PASSPHRASE,
+    PREFECT_API_PROXY_URL,
     PREFECT_ORION_DATABASE_CONNECTION_URL,
 )
 
@@ -132,6 +133,9 @@ class OrionClient:
             ))
         elif PREFECT_API_CLIENT_CERT_PATH:
             httpx_settings.setdefault("cert", PREFECT_API_CLIENT_CERT_PATH.value())
+
+        if PREFECT_API_PROXY_URL:
+            httpx_settings.setdefault("proxies", PREFECT_API_PROXY_URL.value())
 
         if api_version is None:
             # deferred import to avoid importing the entire server unless needed

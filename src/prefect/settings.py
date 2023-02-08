@@ -441,6 +441,20 @@ client.key).
 This provides an alternative approach to bearer tokens for securing API endpoints
 """
 
+PREFECT_API_PROXY_URL = Setting(
+    str,
+    default=None,
+    is_secret=False
+)
+"""
+If provided, the url of a http (or optionally a socks5) proxy to comminicate with an externally-hosted
+Orion API endpoint. 
+
+The optional socks package is needed for socks5 proxies. Install with:
+
+pip install httpx[socks]
+"""
+
 PREFECT_CLOUD_API_URL = Setting(
     str,
     default="https://api.prefect.cloud/api",
