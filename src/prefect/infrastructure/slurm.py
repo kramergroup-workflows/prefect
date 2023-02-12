@@ -1,6 +1,6 @@
-import time
+import time, os
 from io import StringIO
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import anyio.abc
 from fabric import Connection
@@ -12,11 +12,16 @@ from typing_extensions import Literal
 from prefect.blocks.core import SecretStr
 from prefect.infrastructure.base import Infrastructure, InfrastructureResult
 from prefect.utilities.asyncutils import run_sync_in_worker_thread, sync_compatible
-
+from prefect.infrastructure.process import Process
 
 class SlurmJobResult(InfrastructureResult):
     """Contains information about the final state of a completed Slurm Job"""
 
+class SlurmJob(Process):
+
+  type: Literal["slurm-job"] = Field(
+      default="slurm-job", description="The type of infrastructure."
+  )
 
 class SlurmJob(Infrastructure):
     """
@@ -38,11 +43,19 @@ class SlurmJob(Infrastructure):
         default=None, description=("The username of your account on the cluster")
     )
 
+    pre_run: Optional[List[str]] = Field(
+        default=[], description=("Commands to run before executing the flow with the slurm job")
+    )
+
+    post_run: Optional[List[str]] = Field(
+        default=[], description=("Commands to run after executing the flow with the slurm job")
+    )
+
     password: SecretStr = Field(
         default=None, description=("The password to authenticate username")
     )
 
-    slurm_kwargs: dict[str, str] = Field(
+    slurm_kwargs: Optional[dict[str, str]] = Field(
         default=None,
         description=(
             "A dictionary with slurm batch arguments as key-value pairs. E.g, the parameter --nodes=1"
@@ -54,8 +67,11 @@ class SlurmJob(Infrastructure):
         self,
         task_status: Optional[anyio.abc.TaskStatus] = None,
     ) -> SlurmJobResult:
+
         if not self.command:
             raise ValueError("Slurm job cannot be run with empty command.")
+
+        self.logger.info(self.preview())
 
         jobid = (await run_sync_in_worker_thread(self._create_job)).strip()
 
@@ -70,41 +86,24 @@ class SlurmJob(Infrastructure):
 
         return SlurmJobResult(identifier=pid, status_code=status_code)
 
+    # @sync_compatible
+    # async def run(
+    #     self,
+    #     task_status: Optional[anyio.abc.TaskStatus] = None,
+    # ) -> SlurmJobResult:
+    #     if not self.command:
+    #         raise ValueError("Slurm job cannot be run with empty command.")
+
+    #     pid,return_code = await self.run_slurm_job(task_status)
+    #     return SlurmJobResult(identifier=pid, status_code=0)
+
     def preview(self):
         return self._get_submit_script()
 
     async def kill(self, infrastructure_pid: str, grace_seconds: int = 30):
         _, jobid = self._parse_infrastructure_pid(infrastructure_pid)
 
-        with self._get_connection() as c:
-            try:
-                c.run(self._get_kill_command(jobid), timeout=grace_seconds)
-            except UnexpectedExit:
-                self.logger.warn(
-                    f"Slurm Job: sbatch exited with unexpected result (non-zero exit code)."
-                )
-            except Failure:
-                self.logger.error(f"Slurm Job {jobid!r}: scancel did not exit cleanly.")
-            except ThreadException:
-                self.logger.error(
-                    f"Slurm Job {jobid!r}: scancel IO streams encountered problems."
-                )
-            except TimeoutError:
-                self.logger.error(
-                    f"Slurm Job {jobid!r}: scancel did not finish in time."
-                )
-            finally:
-                c.close()
-
-    def _get_connection(self) -> Connection:
-        """
-        Return a connection to the slurm login node
-        """
-        return Connection(
-            host=self.host,
-            user=self.username,
-            connect_kwargs={"password": self.password.get_secret_value()},
-        )
+        self._run_remote_command(self._get_kill_command(jobid), grace_seconds=grace_seconds)
 
     def _create_job(self, grace_seconds: int = 30) -> str:
         """
@@ -113,7 +112,7 @@ class SlurmJob(Infrastructure):
 
         result = self._run_remote_command(
             cmd=self._get_submit_command(),
-            in_stream=self._get_submit_script(),
+            in_stream=StringIO(self._get_submit_script()),
             grace_seconds=grace_seconds,
         )
 
@@ -133,15 +132,17 @@ class SlurmJob(Infrastructure):
 
         return cmd
 
-    def _get_submit_script(self) -> StringIO:
+    def _get_submit_script(self) -> str:
         """
         Generate the submit script for the slurm job
         """
-        return StringIO(
-            f"""#!/bin/sh
-      {" ".join(self.command)}
-      """
-        )
+        script = ["#!/bin/bash"]
+        script += [f"export {k}={v}" for k, v in self._get_environment_variables(False).items()]
+        script += self.pre_run
+        script += [" ".join(self.command)]
+        script += self.post_run
+
+        return "\n".join(script)
 
     def _get_kill_command(self, jobid: int) -> str:
         """
@@ -215,6 +216,17 @@ class SlurmJob(Infrastructure):
             # TODO Make interval parameterisable
             time.sleep(10)
 
+    def _get_connection(self) -> Connection:
+        """
+        Return a connection to the slurm login node
+        """
+        return Connection(
+            host=self.host,
+            user=self.username,
+            connect_kwargs={"password": self.password.get_secret_value()},
+        )
+
+
     def _run_remote_command(
         self, cmd: str, in_stream=None, grace_seconds: int = 30, safe=False
     ) -> Result:
@@ -253,3 +265,12 @@ class SlurmJob(Infrastructure):
                 c.close()
 
         return result
+
+    def _get_environment_variables(self, include_os_environ: bool = True):
+      os_environ = os.environ if include_os_environ else {}
+      # The base environment must override the current environment or
+      # the Prefect settings context may not be respected
+      env = {**os_environ, **self._base_environment(), **self.env}
+
+      # Drop null values allowing users to "unset" variables
+      return {key: value for key, value in env.items() if value is not None}
