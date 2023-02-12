@@ -1,4 +1,6 @@
 import time, os
+import abc
+
 from io import StringIO
 from typing import Optional, Tuple, List
 
@@ -14,14 +16,168 @@ from prefect.infrastructure.base import Infrastructure, InfrastructureResult
 from prefect.utilities.asyncutils import run_sync_in_worker_thread, sync_compatible
 from prefect.infrastructure.process import Process
 
+from io import TextIOBase
+from enum import Enum
+
+class SlurmJobStatus(Enum):
+    COMPLETED=0
+    RUNNING=1
+    FAILED=2
+    PREEMPTED=3
+    PENDING=4
+    UNDEFINED=5
+    UNKNOWN=6
+class SlurmBackend:
+
+    @abc.abstractmethod
+    def submit(self,slurm_kwargs:dict[str,str],run_script:TextIOBase=None, grace_seconds:int=30) -> int:
+        """Submit a new SLURM Job to process a flow rum"""
+
+    @abc.abstractmethod
+    def status(self,jobid:int, grace_seconds:int=30) -> SlurmJobStatus:  
+        """Obtain the status of a SLURM job"""
+
+    @abc.abstractmethod
+    def kill(self,jobid:int, grace_seconds:int=30):
+        """Cancel the job with jobid"""
+
+class CLIBasedSlurmBackend(SlurmBackend):
+
+    host:str
+    username:str
+    password:str
+
+    def __init__(self,host:str, username:str, password:str):
+        self.host=host
+        self.username=username
+        self.password=password
+
+    def submit(self,slurm_kwargs:dict[str,str], run_script:TextIOBase=None, grace_seconds:int=30) -> int:
+        
+        result = self._run_remote_command(
+            cmd=self._submit_command(slurm_kwargs),
+            in_stream=run_script,
+            grace_seconds=grace_seconds,
+        )
+
+        return int(result.stdout.strip())
+
+    def kill(self,jobid:int, grace_seconds:int=30):
+
+        self._run_remote_command(
+              cmd=self._kill_command(jobid),
+              grace_seconds=grace_seconds,
+        )
+
+    def status(self,jobid:int, grace_seconds:int=30) -> SlurmJobStatus:
+
+        result = self._run_remote_command(
+            cmd=self._status_command(jobid),
+            grace_seconds=grace_seconds,
+        )
+
+        # Status command exits with non-zero exit code if jobid is not found.
+        # This includes finished jobs that have been removed from the queue!!!!
+        if result.exited != 0: return SlurmJobStatus.UNDEFINED
+
+        try:
+          status, exit_code = [v.strip() for v in result.stdout.split()[0:2]]
+
+          if status == "PENDING": return SlurmJobStatus.PENDING
+          if status == "COMPLETED": return SlurmJobStatus.COMPLETED
+          if status == "PREEMPTED": return SlurmJobStatus.PREEMPTED
+          if status == "FAILED": return SlurmJobStatus.FAILED
+          if status == "RUNNING": return SlurmJobStatus.RUNNING
+
+          return SlurmJobStatus.UNKNOWN
+        except:
+          return SlurmJobStatus.UNDEFINED
+
+
+    def _run_remote_command(
+      self, cmd: str, in_stream=None, grace_seconds: int = 30, safe=False
+    ) -> Result:
+
+      result = None
+      with self._get_connection() as c:
+
+          try:
+              result = c.run(
+                  cmd, in_stream=in_stream, timeout=grace_seconds, hide="both"
+              )
+          except UnexpectedExit:
+              self.logger.warn(
+                  f"Slurm Job: [{cmd}] exited with unexpected result (non-zero exit code)."
+              )
+              if not safe:
+                  raise
+          except Failure:
+              self.logger.error(f"Slurm Job: [{cmd}] did not exit cleanly.")
+              if not safe:
+                  raise
+          except ThreadException:
+              self.logger.error(
+                  f"Slurm Job: [{cmd}] IO streams encountered problems."
+              )
+              if not safe:
+                  raise
+          except TimeoutError:
+              self.logger.error(f"Slurm Job: [{cmd}] did not finish in time.")
+              if not safe:
+                  raise
+          except:
+              if not safe:
+                  raise
+          finally:
+              c.close()
+
+      return result
+
+
+    def _submit_command(self,slurm_kwargs:dict[str,str]) -> str:
+        """
+        Generates the sbatch command to submit a job to slurm
+        """
+
+        ## Create the arguments from slurm_kwargs
+        args = [
+            f"--{k}" if v == None else f"--{k}={v}" for k, v in slurm_kwargs.items()
+        ]
+        cmd = " ".join(["sbatch", "--parsable"] + args)
+
+        return cmd
+
+
+    def _kill_command(self, jobid: int) -> str:
+        """
+        Generates the kill command to terminate a slurm job
+        """
+
+        return f"scancel ${jobid}"
+    
+
+    def _status_command(self, jobid) -> str:
+        """
+        Generate the squeue command to monitor job status
+        """
+
+        return f"squeue --job={jobid} --Format=State,exit_code --noheader"
+
+
+    def _get_connection(self) -> Connection:
+        """
+        Return a connection to the slurm login node
+        """
+        return Connection(
+            host=self.host,
+            user=self.username,
+            connect_kwargs={"password": self.password.get_secret_value()},
+        )
+
+
 class SlurmJobResult(InfrastructureResult):
     """Contains information about the final state of a completed Slurm Job"""
 
-class SlurmJob(Process):
-
-  type: Literal["slurm-job"] = Field(
-      default="slurm-job", description="The type of infrastructure."
-  )
 
 class SlurmJob(Infrastructure):
     """
@@ -71,68 +227,33 @@ class SlurmJob(Infrastructure):
         if not self.command:
             raise ValueError("Slurm job cannot be run with empty command.")
 
-        self.logger.info(self.preview())
+        backend = CLIBasedSlurmBackend(self.host,self.username,self.password)
 
-        jobid = (await run_sync_in_worker_thread(self._create_job)).strip()
-
+        jobid = await run_sync_in_worker_thread(backend.submit, self.slurm_kwargs, StringIO(self._submit_script()))
         pid = await run_sync_in_worker_thread(self._get_infrastructure_pid, jobid)
 
-        self.logger.info(task_status)
         if task_status is not None:
             task_status.started(pid)
 
+        self.logger.info(f"Slurm Job: Job {jobid} submitted and registered as {pid}.")
+
         # Monitor the job until completion
-        status_code = await run_sync_in_worker_thread(self._watch_job, jobid)
+        status_code = await run_sync_in_worker_thread(self._watch_job, backend, jobid)
 
         return SlurmJobResult(identifier=pid, status_code=status_code)
 
-    # @sync_compatible
-    # async def run(
-    #     self,
-    #     task_status: Optional[anyio.abc.TaskStatus] = None,
-    # ) -> SlurmJobResult:
-    #     if not self.command:
-    #         raise ValueError("Slurm job cannot be run with empty command.")
-
-    #     pid,return_code = await self.run_slurm_job(task_status)
-    #     return SlurmJobResult(identifier=pid, status_code=0)
 
     def preview(self):
-        return self._get_submit_script()
+        return "Not implemented"
+
 
     async def kill(self, infrastructure_pid: str, grace_seconds: int = 30):
         _, jobid = self._parse_infrastructure_pid(infrastructure_pid)
 
         self._run_remote_command(self._get_kill_command(jobid), grace_seconds=grace_seconds)
 
-    def _create_job(self, grace_seconds: int = 30) -> str:
-        """
-        Submit a slurm job
-        """
 
-        result = self._run_remote_command(
-            cmd=self._get_submit_command(),
-            in_stream=StringIO(self._get_submit_script()),
-            grace_seconds=grace_seconds,
-        )
-
-        return result.stdout
-
-    def _get_submit_command(self) -> str:
-        """
-        Generates the sbatch command to submit a job to slurm
-        """
-
-        ## Create the arguments from slurm_kwargs
-        args = [
-            f"--{k}" if v == None else f"--{k}={v}"
-            for k, v in self.slurm_kwargs.items()
-        ]
-        cmd = " ".join(["sbatch", "--parsable"] + args)
-
-        return cmd
-
-    def _get_submit_script(self) -> str:
+    def _submit_script(self) -> str:
         """
         Generate the submit script for the slurm job
         """
@@ -144,12 +265,6 @@ class SlurmJob(Infrastructure):
 
         return "\n".join(script)
 
-    def _get_kill_command(self, jobid: int) -> str:
-        """
-        Generates the kill command to terminate a slurm job
-        """
-
-        return f"scancel ${jobid}"
 
     def _get_infrastructure_pid(self, jobid: str) -> str:
         """
@@ -159,6 +274,7 @@ class SlurmJob(Infrastructure):
         """
         pid = f"{self.host}:{jobid}"
         return pid
+
 
     def _parse_infrastructure_pid(
         self,
@@ -171,100 +287,48 @@ class SlurmJob(Infrastructure):
         hostname, pid = infrastructure_pid.split(":")
         return hostname, int(pid)
 
-    def _get_job_status_command(self, jobid) -> str:
-        """
-        Generate the squeue command to monitor job status
-        """
 
-        return f"squeue --job={jobid} --Format=State,exit_code --noheader"
-
-    def _watch_job(self, jobid: str) -> int:
+    def _watch_job(self, backend:SlurmBackend, jobid: str, polling_seconds: int=30) -> int:
 
         completed = False
         submitted = False
 
+        startWatching = time.time()
+
         while not completed:
 
-            result = self._run_remote_command(self._get_job_status_command(jobid))
+            status = backend.status(jobid)
 
             # Job never seen on the slurm queue
-            if result.exited != 0 and not submitted:
-                self.logger.error(f"Slurm Job {jobid!r}: Job not known to slurm.")
-                completed = True
-                return -1
+            if (status == status.UNDEFINED) and not submitted:
+                self.logger.error(f"Slurm Job: Job {jobid!r} not known to slurm.")
+                
+                if (time.time() - startWatching) < polling_seconds:
+                  # Just started watching, give the slurm agent some time to process the submission
+                  continue
+                else:
+                  completed = True
+                  return -1
+
+            # This point is only reached if the jobid is known to slurm in an interation
+            submitted = True
 
             # Job removed from slurm queue - assume it finished ok
-            if (result.exited != 0 or result.stdout == "") and submitted:
-                self.logger.info(f"Slurm Job {jobid!r}: Job finished/cleared.")
+            if (status == status.UNDEFINED) or (status == status.COMPLETED):
+                self.logger.info(f"Slurm Job: Job {jobid!r} finished/cleared.")
                 completed = True
                 return 0
 
-            submitted = True
-
-            status, exit_code = result.stdout.split()[0:2]
-
-            if status in ["COMPLETED"]:
-                self.logger.info(f"Slurm Job {jobid!r}: Job {status}.")
-                completed = True
-                return int(exit_code)
-
-            if status in ["PREEMPTED"]:
-                self.logger.error(f"Slurm Job {jobid!r}: Job {status}.")
+            if status == status.FAILED:
+                self.logger.warn(f"Slurm Job: Job {jobid!r} failed.")
                 completed = True
                 return -1
 
-            # TODO Make interval parameterisable
-            time.sleep(10)
+            time.sleep(polling_seconds)
 
-    def _get_connection(self) -> Connection:
-        """
-        Return a connection to the slurm login node
-        """
-        return Connection(
-            host=self.host,
-            user=self.username,
-            connect_kwargs={"password": self.password.get_secret_value()},
-        )
+        # we should never reach this point!
+        return -1
 
-
-    def _run_remote_command(
-        self, cmd: str, in_stream=None, grace_seconds: int = 30, safe=False
-    ) -> Result:
-
-        result = None
-        with self._get_connection() as c:
-
-            try:
-                result = c.run(
-                    cmd, in_stream=in_stream, timeout=grace_seconds, hide="both"
-                )
-            except UnexpectedExit:
-                self.logger.warn(
-                    f"Slurm Job: [{cmd}] exited with unexpected result (non-zero exit code)."
-                )
-                if not safe:
-                    raise
-            except Failure:
-                self.logger.error(f"Slurm Job: [{cmd}] did not exit cleanly.")
-                if not safe:
-                    raise
-            except ThreadException:
-                self.logger.error(
-                    f"Slurm Job: [{cmd}] IO streams encountered problems."
-                )
-                if not safe:
-                    raise
-            except TimeoutError:
-                self.logger.error(f"Slurm Job: [{cmd}] did not finish in time.")
-                if not safe:
-                    raise
-            except:
-                if not safe:
-                    raise
-            finally:
-                c.close()
-
-        return result
 
     def _get_environment_variables(self, include_os_environ: bool = True):
       os_environ = os.environ if include_os_environ else {}
