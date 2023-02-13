@@ -5,9 +5,12 @@ from io import StringIO
 from typing import Optional, Tuple, List
 
 import anyio.abc
+
 from fabric import Connection
 from invoke.exceptions import Failure, ThreadException, UnexpectedExit
 from invoke.runners import Result
+from sshfs import SSHFileSystem
+
 from pydantic import Field
 from typing_extensions import Literal
 
@@ -20,6 +23,11 @@ from io import TextIOBase
 from enum import Enum
 
 class SlurmJobStatus(Enum):
+  
+    """"
+    Models the different states of a SLURM Job.
+    """
+  
     COMPLETED=0
     RUNNING=1
     FAILED=2
@@ -27,11 +35,18 @@ class SlurmJobStatus(Enum):
     PENDING=4
     UNDEFINED=5
     UNKNOWN=6
+
+
 class SlurmBackend:
+  
+    """
+    Backend to interact with the SLURM scheduler. This is an abstract base class. Specialised implementations
+    should either use CLI or API-based controll of the scheduler.
+    """
 
     @abc.abstractmethod
     def submit(self,slurm_kwargs:dict[str,str],run_script:TextIOBase=None, grace_seconds:int=30) -> int:
-        """Submit a new SLURM Job to process a flow rum"""
+        """Submit a new SLURM Job to process a flow run"""
 
     @abc.abstractmethod
     def status(self,jobid:int, grace_seconds:int=30) -> SlurmJobStatus:  
@@ -43,6 +58,17 @@ class SlurmBackend:
 
 class CLIBasedSlurmBackend(SlurmBackend):
 
+    """
+    CLI-based backend to control a slurm scheduler
+
+    Parameters
+    ----------
+
+    host (str)      The hostname (usually the login-node) on which the slurm commands sbatch, squeue, and scancel are available
+    username (str)  The username to authenticate with the hpc system via ssh
+    password (str)  The password to authenticate the user via ssh
+    """
+    
     host:str
     username:str
     password:str
@@ -207,6 +233,14 @@ class SlurmJob(Infrastructure):
         default=[], description=("Commands to run after executing the flow with the slurm job")
     )
 
+    working_directory: Optional[str] = Field(
+        default=None, description="Base directory for slurm runs. If specified, a subdirectory (if needed) will be created for each flow run."
+    )
+
+    retain_working_directory: Optional[bool] = Field(
+      default=False, description="If set, the temporary working directory will not be deleted after the slurm job has finished."
+    )
+
     password: SecretStr = Field(
         default=None, description=("The password to authenticate username")
     )
@@ -217,7 +251,11 @@ class SlurmJob(Infrastructure):
             "A dictionary with slurm batch arguments as key-value pairs. E.g, the parameter --nodes=1"
         ),
     )
-
+    
+    stream_output: bool = Field(
+        default=True,
+        description="If set, output will be streamed from the job to local standard output.",
+    )
 
     _backend_instance : SlurmBackend = None
 
@@ -238,6 +276,20 @@ class SlurmJob(Infrastructure):
         if not self.command:
             raise ValueError("Slurm job cannot be run with empty command.")
 
+        # Prepare working directory
+        flow_run_id = self._get_environment_variables()['PREFECT__FLOW_RUN_ID']
+        wdir = os.path.join(self.working_directory if self.working_directory else ".", flow_run_id)
+        
+        fs = self._filesystem()            
+        fs.mkdir(wdir)
+        self.logger.debug(f"Slurm Job: created flow run dir [{wdir}] on host [{self.host}]")
+        self.slurm_kwargs["chdir"] = wdir
+          
+        # Configure output files
+        self.slurm_kwargs['output'] = "output.log"
+        self.slurm_kwargs['error'] = "error.log"
+          
+        # Submit slurm job
         jobid = await run_sync_in_worker_thread(self._backend.submit, self.slurm_kwargs, StringIO(self._submit_script()))
         pid = await run_sync_in_worker_thread(self._get_infrastructure_pid, jobid)
 
@@ -248,6 +300,23 @@ class SlurmJob(Infrastructure):
 
         # Monitor the job until completion
         status_code = await run_sync_in_worker_thread(self._watch_job, self._backend, jobid)
+
+        # Capture output
+        if self.stream_output:
+            try: 
+              with fs.open(os.path.join(wdir,self.slurm_kwargs['output']),'r') as stream:
+                  print(stream.read())
+              with fs.open(os.path.join(wdir,self.slurm_kwargs['error']),'r') as stream:
+                  print(stream.read())
+            except:
+              self.logger.error("Could not retrieve logs from slurm job")
+
+        # Cleanup after run
+        if not self.retain_working_directory:
+            try:
+              fs.rmdir(wdir)
+            except:
+              self.logger.error(f"Slurm Job: could not delete working directory for flow run [{flow_run_id}] on host [{self.host}]")
 
         return SlurmJobResult(identifier=pid, status_code=status_code)
 
@@ -346,3 +415,14 @@ class SlurmJob(Infrastructure):
 
       # Drop null values allowing users to "unset" variables
       return {key: value for key, value in env.items() if value is not None}
+
+
+    def _filesystem(self) -> SSHFileSystem:
+        """
+        Return a connection to the slurm login node filesystem via ssh
+        """
+        return SSHFileSystem(
+            host=self.host,
+            username=self.username,
+            password=self.password.get_secret_value(),
+        )
