@@ -218,6 +218,17 @@ class SlurmJob(Infrastructure):
         ),
     )
 
+
+    _backend_instance : SlurmBackend = None
+
+    @property
+    def _backend(self) -> SlurmBackend:
+      if not self._backend_instance: 
+        self.logger.debug(f"Instantiating Slurm CLI-based backend on {self.host} for user {self.username}")
+        self._backend_instance = CLIBasedSlurmBackend(self.host,self.username,self.password)
+
+      return self._backend_instance
+
     @sync_compatible
     async def run(
         self,
@@ -227,9 +238,7 @@ class SlurmJob(Infrastructure):
         if not self.command:
             raise ValueError("Slurm job cannot be run with empty command.")
 
-        backend = CLIBasedSlurmBackend(self.host,self.username,self.password)
-
-        jobid = await run_sync_in_worker_thread(backend.submit, self.slurm_kwargs, StringIO(self._submit_script()))
+        jobid = await run_sync_in_worker_thread(self._backend.submit, self.slurm_kwargs, StringIO(self._submit_script()))
         pid = await run_sync_in_worker_thread(self._get_infrastructure_pid, jobid)
 
         if task_status is not None:
@@ -238,7 +247,7 @@ class SlurmJob(Infrastructure):
         self.logger.info(f"Slurm Job: Job {jobid} submitted and registered as {pid}.")
 
         # Monitor the job until completion
-        status_code = await run_sync_in_worker_thread(self._watch_job, backend, jobid)
+        status_code = await run_sync_in_worker_thread(self._watch_job, self._backend, jobid)
 
         return SlurmJobResult(identifier=pid, status_code=status_code)
 
@@ -249,8 +258,7 @@ class SlurmJob(Infrastructure):
 
     async def kill(self, infrastructure_pid: str, grace_seconds: int = 30):
         _, jobid = self._parse_infrastructure_pid(infrastructure_pid)
-
-        self._run_remote_command(self._get_kill_command(jobid), grace_seconds=grace_seconds)
+        self._backend.kill(jobid)
 
 
     def _submit_script(self) -> str:
