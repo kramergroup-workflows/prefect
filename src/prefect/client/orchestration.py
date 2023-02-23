@@ -56,6 +56,11 @@ from prefect.settings import (
     PREFECT_API_TLS_INSECURE_SKIP_VERIFY,
     PREFECT_API_URL,
     PREFECT_CLOUD_API_URL,
+    PREFECT_API_CLIENT_CERT_PATH,
+    PREFECT_API_CLIENT_KEY_PATH,
+    PREFECT_API_CLIENT_KEY_PASSPHRASE,
+    PREFECT_API_PROXY_URL,
+    PREFECT_ORION_DATABASE_CONNECTION_URL,
 )
 from prefect.utilities.collections import AutoEnum
 
@@ -137,6 +142,23 @@ class PrefectClient:
 
         if PREFECT_API_TLS_INSECURE_SKIP_VERIFY:
             httpx_settings.setdefault("verify", False)
+
+        if PREFECT_API_CLIENT_CERT_PATH and PREFECT_API_CLIENT_KEY_PATH and PREFECT_API_CLIENT_KEY_PASSPHRASE:
+            httpx_settings.setdefault("cert", (
+                PREFECT_API_CLIENT_CERT_PATH.value(),
+                PREFECT_API_CLIENT_KEY_PATH.value(),
+                PREFECT_API_CLIENT_KEY_PASSPHRASE.value()
+            ))
+        elif PREFECT_API_CLIENT_CERT_PATH and PREFECT_API_CLIENT_KEY_PATH:
+            httpx_settings.setdefault("cert", (
+                PREFECT_API_CLIENT_CERT_PATH.value(),
+                PREFECT_API_CLIENT_KEY_PATH.value()
+            ))
+        elif PREFECT_API_CLIENT_CERT_PATH:
+            httpx_settings.setdefault("cert", PREFECT_API_CLIENT_CERT_PATH.value())
+
+        if PREFECT_API_PROXY_URL:
+            httpx_settings.setdefault("proxies", PREFECT_API_PROXY_URL.value())
 
         if api_version is None:
             # deferred import to avoid importing the entire server unless needed
@@ -1451,7 +1473,7 @@ class PrefectClient:
             schedule=schedule if schedule is not None else deployment.schedule,
             is_schedule_active=(
                 is_schedule_active
-                if is_schedule_active is not None
+            if is_schedule_active is not None
                 else deployment.is_schedule_active
             ),
             description=deployment.description,
@@ -2015,7 +2037,7 @@ class PrefectClient:
         body = {
             "flow_run_notification_policy_filter": (
                 flow_run_notification_policy_filter.dict(json_compatible=True)
-                if flow_run_notification_policy_filter
+            if flow_run_notification_policy_filter
                 else None
             ),
             "limit": limit,
@@ -2237,7 +2259,7 @@ class PrefectClient:
         json = {
             "work_queues": (
                 work_queue_filter.dict(json_compatible=True, exclude_unset=True)
-                if work_queue_filter
+            if work_queue_filter
                 else None
             ),
             "limit": limit,

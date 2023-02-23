@@ -516,6 +516,56 @@ If the API does not support HTTP/2, this will have no effect and connections wil
 made via HTTP/1.1.
 """
 
+PREFECT_API_CLIENT_CERT_PATH = Setting(
+    str,
+    default=None,
+    is_secret=False
+)
+"""Path to the SSL public certificate used by prefect client to authenticate with
+API endpoints secured by ssl and client certificate authentication. (usually called
+client.crt or client.pem)
+
+This provides an alternative approach to bearer tokens for securing API endpoints
+"""
+
+PREFECT_API_CLIENT_KEY_PATH = Setting(
+    str,
+    default=None,
+    is_secret=False
+)
+"""Path to the SSL private key used by prefect client to authenticate with
+API endpoints secured by ssl and client certificate authentication (usually called 
+client.key).
+
+This provides an alternative approach to bearer tokens for securing API endpoints
+"""
+
+PREFECT_API_CLIENT_KEY_PASSPHRASE = Setting(
+    str,
+    default=None,
+    is_secret=False
+)
+"""Passphrase to decode the SSL private key used by prefect client to authenticate with
+API endpoints secured by ssl and client certificate authentication (usually called 
+client.key).
+
+This provides an alternative approach to bearer tokens for securing API endpoints
+"""
+
+PREFECT_API_PROXY_URL = Setting(
+    str,
+    default=None,
+    is_secret=False
+)
+"""
+If provided, the url of a http (or optionally a socks5) proxy to comminicate with an externally-hosted
+Orion API endpoint. 
+
+The optional socks package is needed for socks5 proxies. Install with:
+
+pip install httpx[socks]
+"""
+
 PREFECT_CLOUD_API_URL = Setting(
     str,
     default="https://api.prefect.cloud/api",
