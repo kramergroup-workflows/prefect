@@ -1,0 +1,58 @@
+###
+### A complete description of a Prefect Deployment for flow 'hello'
+###
+name: Slurm Log Hostname
+description: null
+version: 9bf0b356a8a65a759bb89a02d8c0f0f8
+# The work queue that will handle this deployment's runs
+work_queue_name: default
+work_pool_name: null
+tags: []
+parameters: {}
+schedule: null
+is_schedule_active: null
+infra_overrides: {}
+
+###
+### DO NOT EDIT BELOW THIS LINE
+###
+flow_name: hello
+manifest_path: null
+infrastructure:
+  type: slurm-job
+  env: {}
+  labels: {}
+  name: HSUper SLURM Queue
+  command: null
+  host: hsuper-login01.hsu-hh.de
+  username: kramerd
+  pre_run:
+  - conda activate prefect
+  post_run: []
+  password: '**********'
+  slurm_kwargs:
+    job-name: prefect
+    partition: small
+    nodes: '1'
+    ntasks-per-node: '72'
+    time: 02:00:00
+  _block_document_id: b5fc0923-9d4a-4e60-ab9c-773511d5002f
+  _block_document_name: hsuper
+  _is_anonymous: false
+  block_type_slug: slurmjob
+  _block_type_slug: slurmjob
+storage: null
+path: /beegfs/home/k/kramerd/prefect
+entrypoint: flows/slurm.py:hello
+parameter_openapi_schema:
+  title: Parameters
+  type: object
+  properties:
+    name:
+      title: name
+      default: world
+      position: 0
+      type: string
+  required: null
+  definitions: null
+timestamp: '2023-02-12T13:51:18.799982+00:00'
